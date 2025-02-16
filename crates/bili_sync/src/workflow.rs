@@ -496,7 +496,8 @@ pub async fn download_page(
             fanart_path,
         )),
         Box::pin(fetch_page_video(
-            separate_status[1],
+            // separate_status[1],
+            false,
             bili_client,
             video_model,
             downloader,
@@ -510,7 +511,8 @@ pub async fn download_page(
             nfo_path,
         )),
         Box::pin(fetch_page_danmaku(
-            separate_status[3],
+            // separate_status[3],
+            false,
             bili_client,
             video_model,
             &page_info,
