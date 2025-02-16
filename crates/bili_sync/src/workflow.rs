@@ -1,7 +1,9 @@
+// 导入所需的标准库和第三方库
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
+// 错误处理和数据库相关的导入
 use anyhow::{anyhow, bail, Context, Result};
 use bili_sync_entity::*;
 use futures::stream::{FuturesOrdered, FuturesUnordered};
@@ -12,6 +14,7 @@ use sea_orm::TransactionTrait;
 use tokio::fs;
 use tokio::sync::Semaphore;
 
+// 导入本地模块
 use crate::adapter::{video_list_from, Args, VideoListModel, VideoListModelEnum};
 use crate::bilibili::{BestStream, BiliClient, BiliError, Dimension, PageInfo, Video, VideoInfo};
 use crate::config::{PathSafeTemplate, ARGS, CONFIG, TEMPLATE};
@@ -26,6 +29,12 @@ use crate::utils::nfo::{ModelWrapper, NFOMode, NFOSerializer};
 use crate::utils::status::{PageStatus, VideoStatus};
 
 /// 完整地处理某个视频列表
+/// 
+/// 主要流程:
+/// 1. 获取视频列表信息
+/// 2. 刷新视频列表,获取新视频
+/// 3. 获取视频详细信息
+/// 4. 下载视频内容(如果不是仅扫描模式)
 pub async fn process_video_list(
     args: Args<'_>,
     bili_client: &BiliClient,
@@ -48,6 +57,12 @@ pub async fn process_video_list(
 }
 
 /// 请求接口，获取视频列表中所有新添加的视频信息，将其写入数据库
+///
+/// 工作流程:
+/// 1. 获取最新视频的时间戳
+/// 2. 遍历视频流,过滤出新视频
+/// 3. 批量写入数据库
+/// 4. 更新最新视频时间戳
 pub async fn refresh_video_list<'a>(
     video_list_model: &VideoListModelEnum,
     video_streams: Pin<Box<dyn Stream<Item = Result<VideoInfo>> + 'a + Send>>,
@@ -96,6 +111,12 @@ pub async fn refresh_video_list<'a>(
 }
 
 /// 筛选出所有未获取到全部信息的视频，尝试补充其详细信息
+///
+/// 工作流程:
+/// 1. 获取未填充完整的视频列表
+/// 2. 遍历视频列表,获取每个视频的标签和详情
+/// 3. 处理404等错误情况
+/// 4. 保存视频详情到数据库
 pub async fn fetch_video_details(
     bili_client: &BiliClient,
     video_list_model: &VideoListModelEnum,
@@ -141,6 +162,13 @@ pub async fn fetch_video_details(
 }
 
 /// 下载所有未处理成功的视频
+///
+/// 工作流程:
+/// 1. 创建并发控制信号量
+/// 2. 获取未处理的视频列表
+/// 3. 并发下载视频
+/// 4. 处理风控和错误情况
+/// 5. 批量更新数据库
 pub async fn download_unprocessed_videos(
     bili_client: &BiliClient,
     video_list_model: &VideoListModelEnum,
@@ -156,6 +184,7 @@ pub async fn download_unprocessed_videos(
         .map(|(video_model, pages_model)| {
             let should_download_upper = !assigned_upper.contains(&video_model.upper_id);
             assigned_upper.insert(video_model.upper_id);
+            // 并发下载视频
             download_video_pages(
                 bili_client,
                 video_list_model,
@@ -194,6 +223,20 @@ pub async fn download_unprocessed_videos(
     Ok(())
 }
 
+/// 下载单个视频的所有分页内容
+///
+/// 工作流程:
+/// 1. 获取并发控制许可
+/// 2. 获取视频状态
+/// 3. 创建文件路径
+/// 4. 并发下载视频相关资源:
+///    - 视频封面
+///    - 视频信息NFO
+///    - UP主头像
+///    - UP主信息NFO
+///    - 视频分P内容
+/// 5. 处理下载结果
+/// 6. 更新视频状态
 #[allow(clippy::too_many_arguments)]
 pub async fn download_video_pages(
     bili_client: &BiliClient,
@@ -281,6 +324,13 @@ pub async fn download_video_pages(
 }
 
 /// 分发并执行分页下载任务，当且仅当所有分页成功下载或达到最大重试次数时返回 Ok，否则根据失败原因返回对应的错误
+///
+/// 工作流程:
+/// 1. 检查是否需要执行
+/// 2. 创建子任务并发控制
+/// 3. 并发下载所有分页
+/// 4. 处理下载结果
+/// 5. 批量更新数据库
 pub async fn dispatch_download_page(
     should_run: bool,
     bili_client: &BiliClient,
@@ -350,20 +400,43 @@ pub async fn dispatch_download_page(
 }
 
 /// 下载某个分页，未发生风控且正常运行时返回 Ok(Page::ActiveModel)，其中 status 字段存储了新的下载状态，发生风控时返回 DownloadAbortError
+///
+/// 工作流程:
+/// 1. 获取并发控制许可
+/// 2. 获取分页状态
+/// 3. 创建文件路径
+/// 4. 并发下载分页资源:
+///    - 分页封面
+///    - 视频内容
+///    - 分页NFO
+///    - 弹幕文件
+///    - 字幕文件
+/// 5. 处理下载结果
+/// 6. 更新分页状态
 pub async fn download_page(
-    bili_client: &BiliClient,
-    video_model: &video::Model,
-    page_model: page::Model,
-    semaphore: &Semaphore,
-    downloader: &Downloader,
-    base_path: &Path,
+    bili_client: &BiliClient,  // B站API客户端
+    video_model: &video::Model, // 视频模型
+    page_model: page::Model,    // 分页模型
+    semaphore: &Semaphore,     // 并发控制信号量
+    downloader: &Downloader,    // 下载器
+    base_path: &Path,          // 基础保存路径
 ) -> Result<page::ActiveModel> {
+    // 获取并发控制许可
     let _permit = semaphore.acquire().await.context("acquire semaphore failed")?;
+    
+    // 获取分页下载状态
     let mut status = PageStatus::from(page_model.download_status);
     let separate_status = status.should_run();
+    
+    // 判断是否为单页视频
     let is_single_page = video_model.single_page.context("single_page is null")?;
+    
+    // 生成基础文件名
     let base_name = TEMPLATE.path_safe_render("page", &page_format_args(video_model, &page_model))?;
+    
+    // 根据是否为单页视频生成不同的文件路径
     let (poster_path, video_path, nfo_path, danmaku_path, fanart_path, subtitle_path) = if is_single_page {
+        // 单页视频的文件路径格式
         (
             base_path.join(format!("{}-poster.jpg", &base_name)),
             base_path.join(format!("{}.mp4", &base_name)),
@@ -373,6 +446,7 @@ pub async fn download_page(
             base_path.join(format!("{}.srt", &base_name)),
         )
     } else {
+        // 多页视频的文件路径格式(剧集格式)
         (
             base_path
                 .join("Season 1")
@@ -386,13 +460,14 @@ pub async fn download_page(
             base_path
                 .join("Season 1")
                 .join(format!("{} - S01E{:0>2}.zh-CN.default.ass", &base_name, page_model.pid)),
-            // 对于多页视频，会在上一步 fetch_video_poster 中获取剧集的 fanart，无需在此处下载单集的
-            None,
+            None, // 多页视频不需要单独的fanart
             base_path
                 .join("Season 1")
                 .join(format!("{} - S01E{:0>2}.srt", &base_name, page_model.pid)),
         )
     };
+
+    // 构建视频分辨率信息
     let dimension = match (page_model.width, page_model.height) {
         (Some(width), Some(height)) => Some(Dimension {
             width,
@@ -401,12 +476,16 @@ pub async fn download_page(
         }),
         _ => None,
     };
+
+    // 构建页面信息
     let page_info = PageInfo {
         cid: page_model.cid,
         duration: page_model.duration,
         dimension,
         ..Default::default()
     };
+
+    // 创建并发下载任务列表
     let tasks: Vec<Pin<Box<dyn Future<Output = Result<()>> + Send>>> = vec![
         Box::pin(fetch_page_poster(
             separate_status[0],
@@ -445,9 +524,15 @@ pub async fn download_page(
             &subtitle_path,
         )),
     ];
+
+    // 按顺序执行下载任务
     let tasks: FuturesOrdered<_> = tasks.into_iter().collect();
     let results: Vec<Result<()>> = tasks.collect().await;
+    
+    // 更新下载状态
     status.update_status(&results);
+
+    // 输出每个任务的执行结果
     results
         .iter()
         .zip(["封面", "视频", "详情", "弹幕", "字幕"])
@@ -461,18 +546,50 @@ pub async fn download_page(
                 &video_model.name, page_model.pid, task_name, e
             ),
         });
-    // 如果下载视频时触发风控，直接返回 DownloadAbortError
+
+    // 检查视频下载是否触发风控
     if let Err(e) = results.into_iter().nth(1).context("video download result not found")? {
         if let Ok(BiliError::RiskControlOccurred) = e.downcast::<BiliError>() {
             bail!(DownloadAbortError());
         }
     }
+
+    // 更新分页模型状态
     let mut page_active_model: page::ActiveModel = page_model.into();
     page_active_model.download_status = Set(status.into());
     page_active_model.path = Set(Some(video_path.to_string_lossy().to_string()));
     Ok(page_active_model)
 }
 
+// 建议: 如何在下载分页资源时不下载"视频内容"和"弹幕文件"资源
+// 1. 修改 PageStatus::should_run() 方法，让对应位置返回 false
+// 2. 在创建 tasks 向量时，可以根据配置选择性地添加任务:
+/*
+let mut tasks: Vec<Pin<Box<dyn Future<Output = Result<()>> + Send>>> = Vec::new();
+
+// 添加封面下载任务
+tasks.push(Box::pin(fetch_page_poster(...)));
+
+// 根据配置决定是否添加视频和弹幕下载任务
+if config.download_video {
+    tasks.push(Box::pin(fetch_page_video(...)));
+}
+
+// 添加NFO生成任务
+tasks.push(Box::pin(generate_page_nfo(...)));
+
+// 根据配置决定是否添加弹幕下载任务
+if config.download_danmaku {
+    tasks.push(Box::pin(fetch_page_danmaku(...)));
+}
+
+// 添加字幕下载任务
+tasks.push(Box::pin(fetch_page_subtitle(...)));
+*/
+
+/// 下载分页封面图片
+///
+/// 对于单页视频使用视频封面,对于多页视频使用分页封面(如果有)或视频封面
 pub async fn fetch_page_poster(
     should_run: bool,
     video_model: &video::Model,
@@ -502,6 +619,12 @@ pub async fn fetch_page_poster(
     Ok(())
 }
 
+/// 下载分页视频内容
+///
+/// 支持以下情况:
+/// 1. 混合流(音视频在一起)
+/// 2. 仅视频流
+/// 3. 分离的音视频流(需要合并)
 pub async fn fetch_page_video(
     should_run: bool,
     bili_client: &BiliClient,
@@ -545,6 +668,7 @@ pub async fn fetch_page_video(
     }
 }
 
+/// 下载分页弹幕文件
 pub async fn fetch_page_danmaku(
     should_run: bool,
     bili_client: &BiliClient,
@@ -563,6 +687,16 @@ pub async fn fetch_page_danmaku(
         .await
 }
 
+/// 下载分页字幕文件
+///
+/// 支持多语言字幕,每个语言保存为独立的文件
+/// 
+/// # 参数
+/// - should_run: 是否执行下载,用于控制流程
+/// - bili_client: B站API客户端
+/// - video_model: 视频数据模型
+/// - page_info: 分P信息
+/// - subtitle_path: 字幕文件保存路径
 pub async fn fetch_page_subtitle(
     should_run: bool,
     bili_client: &BiliClient,
@@ -570,22 +704,37 @@ pub async fn fetch_page_subtitle(
     page_info: &PageInfo,
     subtitle_path: &Path,
 ) -> Result<()> {
+    // 如果不需要执行,直接返回
     if !should_run {
         return Ok(());
     }
+    
+    // 创建视频对象并获取字幕列表
     let bili_video = Video::new(bili_client, video_model.bvid.clone());
     let subtitles = bili_video.get_subtitles(page_info).await?;
+    
+    // 并发下载所有语言的字幕
     let tasks = subtitles
         .into_iter()
         .map(|subtitle| async move {
+            // 为每种语言生成独立的srt文件路径
             let path = subtitle_path.with_extension(format!("{}.srt", subtitle.lan));
             tokio::fs::write(path, subtitle.body.to_string()).await
         })
         .collect::<FuturesUnordered<_>>();
+    
+    // 等待所有字幕下载完成
     tasks.try_collect::<Vec<()>>().await?;
     Ok(())
 }
 
+/// 生成分P的NFO元数据文件
+/// 
+/// # 参数
+/// - should_run: 是否执行生成
+/// - video_model: 视频数据模型
+/// - page_model: 分P数据模型
+/// - nfo_path: NFO文件保存路径
 pub async fn generate_page_nfo(
     should_run: bool,
     video_model: &video::Model,
@@ -595,15 +744,22 @@ pub async fn generate_page_nfo(
     if !should_run {
         return Ok(());
     }
+    
+    // 判断是否为单P视频,选择不同的NFO模式
     let single_page = video_model.single_page.context("single_page is null")?;
     let nfo_serializer = if single_page {
+        // 单P视频使用MOVIE模式
         NFOSerializer(ModelWrapper::Video(video_model), NFOMode::MOVIE)
     } else {
+        // 多P视频使用EPISODE模式
         NFOSerializer(ModelWrapper::Page(page_model), NFOMode::EPOSODE)
     };
     generate_nfo(nfo_serializer, nfo_path).await
 }
 
+/// 下载视频封面图片
+/// 
+/// 下载封面并复制一份作为fanart
 pub async fn fetch_video_poster(
     should_run: bool,
     video_model: &video::Model,
@@ -614,11 +770,14 @@ pub async fn fetch_video_poster(
     if !should_run {
         return Ok(());
     }
+    // 下载封面图片
     downloader.fetch(&video_model.cover, &poster_path).await?;
+    // 复制一份作为fanart
     fs::copy(&poster_path, &fanart_path).await?;
     Ok(())
 }
 
+/// 下载UP主头像
 pub async fn fetch_upper_face(
     should_run: bool,
     video_model: &video::Model,
@@ -631,6 +790,7 @@ pub async fn fetch_upper_face(
     downloader.fetch(&video_model.upper_face, &upper_face_path).await
 }
 
+/// 生成UP主信息的NFO文件
 pub async fn generate_upper_nfo(should_run: bool, video_model: &video::Model, nfo_path: PathBuf) -> Result<()> {
     if !should_run {
         return Ok(());
@@ -639,6 +799,7 @@ pub async fn generate_upper_nfo(should_run: bool, video_model: &video::Model, nf
     generate_nfo(nfo_serializer, nfo_path).await
 }
 
+/// 生成视频信息的NFO文件
 pub async fn generate_video_nfo(should_run: bool, video_model: &video::Model, nfo_path: PathBuf) -> Result<()> {
     if !should_run {
         return Ok(());
@@ -648,10 +809,16 @@ pub async fn generate_video_nfo(should_run: bool, video_model: &video::Model, nf
 }
 
 /// 创建 nfo_path 的父目录，然后写入 nfo 文件
+/// 
+/// # 参数
+/// - serializer: NFO序列化器
+/// - nfo_path: NFO文件保存路径
 async fn generate_nfo(serializer: NFOSerializer<'_>, nfo_path: PathBuf) -> Result<()> {
+    // 确保父目录存在
     if let Some(parent) = nfo_path.parent() {
         fs::create_dir_all(parent).await?;
     }
+    // 生成并写入NFO内容
     fs::write(
         nfo_path,
         serializer.generate_nfo(&CONFIG.nfo_time_type).await?.as_bytes(),
@@ -660,6 +827,7 @@ async fn generate_nfo(serializer: NFOSerializer<'_>, nfo_path: PathBuf) -> Resul
     Ok(())
 }
 
+/// 单元测试模块
 #[cfg(test)]
 mod tests {
     use handlebars::handlebars_helper;
@@ -667,9 +835,13 @@ mod tests {
 
     use super::*;
 
+    /// 测试模板使用功能
     #[test]
     fn test_template_usage() {
+        // 初始化Handlebars模板引擎
         let mut template = handlebars::Handlebars::new();
+        
+        // 注册truncate辅助函数用于截断字符串
         handlebars_helper!(truncate: |s: String, len: usize| {
             if s.chars().count() > len {
                 s.chars().take(len).collect::<String>()
@@ -678,10 +850,14 @@ mod tests {
             }
         });
         template.register_helper("truncate", Box::new(truncate));
+        
+        // 注册各种测试模板
         let _ = template.path_safe_register("video", "test{{bvid}}test");
         let _ = template.path_safe_register("test_truncate", "哈哈，{{ truncate title 30 }}");
         let _ = template.path_safe_register("test_path_unix", "{{ truncate title 7 }}/test/a");
         let _ = template.path_safe_register("test_path_windows", r"{{ truncate title 7 }}\\test\\a");
+        
+        // 针对不同操作系统测试路径处理
         #[cfg(not(windows))]
         {
             assert_eq!(
@@ -712,12 +888,16 @@ mod tests {
                 r"关注_永雏塔菲\\test\\a"
             );
         }
+        
+        // 测试基本模板渲染
         assert_eq!(
             template
                 .path_safe_render("video", &json!({"bvid": "BV1b5411h7g7"}))
                 .unwrap(),
             "testBV1b5411h7g7test"
         );
+        
+        // 测试长文本截断
         assert_eq!(
             template
                 .path_safe_render(
